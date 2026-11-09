@@ -1,0 +1,14 @@
+{
+  "rules": {
+    ".read": "auth != null && auth.token.admin === true",
+    ".write": false,
+    "chats": {
+      "$uid": {
+        ".read": "auth != null && auth.uid === $uid && root.child('members').child($uid).exists() && root.child('members').child($uid).child('disabled').val() !== true"
+      }
+    },
+    "flopQuestions": {
+      ".indexOn": ["uid", "telegramMessageId", "status"]
+    }
+  }
+}

@@ -1,0 +1,42 @@
+# working notes, kept local
+PLAN.md
+
+# build output
+dist/
+
+# dependencies
+node_modules/
+
+# environment
+.env
+.env.*
+!.env.example
+
+# secrets: service account keys never go in the repo
+.secrets/
+*-firebase-adminsdk-*.json
+service-account*.json
+
+# firebase
+.firebase/
+firebase-debug.log*
+database-debug.log*
+ui-debug.log*
+emulator-data/
+
+# review screenshots: attached to the pull request, never committed
+.review-shots/
+
+# logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# editors & os
+.DS_Store
+.vscode/
+!.vscode/extensions.json
+.idea/
+
+# the knowledge base: a local working copy, pushed to its bucket by scripts/kb-push.sh
+kb/

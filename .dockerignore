@@ -1,0 +1,11 @@
+node_modules
+dist
+.git
+.env
+.env.*
+.secrets
+PLAN.md
+*.log
+
+# The knowledge base is read from its bucket at run time; a local copy never goes into the image.
+kb

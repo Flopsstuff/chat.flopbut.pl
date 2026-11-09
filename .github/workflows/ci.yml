@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+      # The Firebase emulators used by the tests need Java 21 or newer.
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/firebase/emulators
+          key: firebase-emulators-${{ hashFiles('pnpm-lock.yaml') }}
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm verify
+
+  deploy:
+    needs: verify
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      REGION: europe-west1
+      PROJECT: flopbut
+      SERVICE: chat
+      IMAGE: europe-west1-docker.pkg.dev/flopbut/chat/app
+      DATABASE_URL: https://flopbut-default-rtdb.europe-west1.firebasedatabase.app
+    steps:
+      - uses: actions/checkout@v7
+      # Without an owner nobody can administer the chat; a stray comma or space is not a list.
+      # The owners' addresses and Flop's Telegram account are repository secrets, so the logs,
+      # public with the repository, show them masked.
+      - name: Require OWNER_EMAILS
+        env:
+          OWNER_EMAILS: ${{ secrets.OWNER_EMAILS }}
+        run: |
+          [[ "$OWNER_EMAILS" == *@* ]] || {
+            echo "Set the OWNER_EMAILS repository secret to at least one address"
+            exit 1
+          }
+      - id: auth
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SA }}
+      - uses: google-github-actions/setup-gcloud@v3
+      # Rules go first, so the service never runs against rules older than the code expects.
+      - name: Deploy RTDB rules
+        run: |
+          curl -fsS -X PUT \
+            -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+            -H "Content-Type: application/json" \
+            --data-binary @database.rules.json \
+            "$DATABASE_URL/.settings/rules.json"
+      - run: gcloud auth configure-docker "$REGION-docker.pkg.dev" --quiet
+      - name: Build and push image
+        run: |
+          TAG="${GITHUB_SHA::7}"
+          docker build -t "$IMAGE:$TAG" .
+          # The knowledge base comes from the bucket at run time, never in the image.
+          docker run --rm --entrypoint sh "$IMAGE:$TAG" -c '! test -e kb'
+          docker push "$IMAGE:$TAG"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+      # The bot comes from repository variables: CHAT_BACKEND (blank means the mock), CHAT_MODEL,
+      # CHAT_BUDGET_USD and CHAT_CONTEXT_TOKENS (blank means the defaults). A backend's key is
+      # mounted from Secret Manager only when it is used, so the mock deploys without any.
+      - name: Deploy to Cloud Run
+        env:
+          CHAT_BACKEND: ${{ vars.CHAT_BACKEND }}
+          CHAT_MODEL: ${{ vars.CHAT_MODEL }}
+          CHAT_BUDGET_USD: ${{ vars.CHAT_BUDGET_USD }}
+          CHAT_CONTEXT_TOKENS: ${{ vars.CHAT_CONTEXT_TOKENS }}
+          OWNER_EMAILS: ${{ secrets.OWNER_EMAILS }}
+          TELEGRAM_OWNER_ID: ${{ secrets.TELEGRAM_OWNER_ID }}
+        run: |
+          # A mounted secret stays on every later revision until it is removed, so the keys of
+          # the backends not in use are taken off (gcloud skips the ones that are not there),
+          # and so is the GitHub token the knowledge base was once read with.
+          OLD=GITHUB_KB_TOKEN
+          # The Telegram bot through which the chat's bot asks Flop is always mounted.
+          TG="TELEGRAM_BOT_TOKEN=telegram-bot-token:latest,TELEGRAM_WEBHOOK_SECRET=telegram-webhook-secret:latest"
+          case "$CHAT_BACKEND" in
+            openrouter)
+              SECRETS=(--update-secrets "OPENROUTER_API_KEY=openrouter-api-key:latest,$TG"
+                --remove-secrets "OPENAI_API_KEY,ANTHROPIC_API_KEY,$OLD") ;;
+            anthropic)
+              SECRETS=(--update-secrets "ANTHROPIC_API_KEY=anthropic-api-key:latest,$TG"
+                --remove-secrets "OPENROUTER_API_KEY,OPENAI_API_KEY,$OLD") ;;
+            openai)
+              SECRETS=(--update-secrets "OPENAI_API_KEY=openai-api-key:latest,$TG"
+                --remove-secrets "OPENROUTER_API_KEY,ANTHROPIC_API_KEY,$OLD") ;;
+            *) SECRETS=(--update-secrets "$TG"
+                --remove-secrets "OPENROUTER_API_KEY,ANTHROPIC_API_KEY,OPENAI_API_KEY,$OLD") ;;
+          esac
+          gcloud run deploy "$SERVICE" \
+            --project "$PROJECT" \
+            --region "$REGION" \
+            --image "$IMAGE:$TAG" \
+            --service-account "chat-runtime@$PROJECT.iam.gserviceaccount.com" \
+            --timeout 600 \
+            --update-env-vars "^;^APP_VERSION=$TAG;KB_BUCKET=flopbut-kb;OWNER_EMAILS=$OWNER_EMAILS;TELEGRAM_OWNER_ID=$TELEGRAM_OWNER_ID;CHAT_BACKEND=$CHAT_BACKEND;CHAT_MODEL=$CHAT_MODEL;CHAT_BUDGET_USD=$CHAT_BUDGET_USD;CHAT_CONTEXT_TOKENS=$CHAT_CONTEXT_TOKENS" \
+            "${SECRETS[@]}" \
+            --quiet
+      - name: Smoke test
+        run: |
+          URL=$(gcloud run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" --format='value(status.url)')
+          curl -fsS "$URL/api/health"
